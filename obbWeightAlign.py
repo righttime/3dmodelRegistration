@@ -496,6 +496,434 @@ def transform_mesh(mesh, verbose=True):
         # 에러가 발생해도 기본 값 반환
         return mesh.copy(), {'error': str(e)}
 
+def select_region_by_angle(mesh, angle_range_x=(-25, 25), angle_range_z=(-5, 5)):
+    """
+    무게중심에서 Y축 방향 기준으로 특정 각도 범위 내의 영역을 선택합니다.
+    
+    Args:
+        mesh: PyVista 메쉬
+        angle_range_x: X축 기준 각도 범위 (도 단위)
+        angle_range_z: Z축 기준 각도 범위 (도 단위)
+        
+    Returns:
+        region_mask: 선택된 영역을 나타내는 불리언 마스크
+    """
+    try:
+        print(f"[로그] 각도 범위 기반 영역 선택 시작: X {angle_range_x}도, Z {angle_range_z}도")
+        
+        # 메쉬 정점 가져오기
+        vertices = mesh.points
+        
+        # 무게중심 계산
+        weight_center = np.mean(vertices, axis=0)
+        print(f"[로그] 무게중심 좌표: {weight_center}")
+        
+        # 각 정점에서 무게중심까지의 벡터
+        vectors = vertices - weight_center
+        
+        # 각 벡터 정규화
+        norms = np.linalg.norm(vectors, axis=1)
+        # 0으로 나누기 방지
+        norms[norms == 0] = 1.0
+        normalized_vectors = vectors / norms.reshape(-1, 1)
+        
+        # 기준 축 설정
+        y_axis = np.array([0, 1, 0])  # Y축 방향 (+Y)
+        x_axis = np.array([1, 0, 0])
+        z_axis = np.array([0, 0, 1])
+        
+        # 로깅을 위한 메쉬 크기 계산
+        mesh_size = np.ptp(vertices, axis=0).max()
+        print(f"[로그] 메쉬 크기: {mesh_size}")
+        
+        # 각 점의 방향 벡터를 Y축과의 각도로 변환
+        # Y축 방향 성분 추출
+        y_components = normalized_vectors[:, 1]  # Y 성분
+        
+        # 양의 Y 방향에 있는 점만 선택 (1차 필터링)
+        positive_y_indices = np.where(y_components > 0)[0]
+        
+        if len(positive_y_indices) == 0:
+            print("[로그] 양의 Y 방향에 점이 없습니다.")
+            return np.zeros(len(vertices), dtype=bool)
+        
+        # 단순화된 각도 계산 방식: YZ 평면과 XY 평면에 투영 후 각도 계산
+        # 변수 초기화
+        in_range = np.zeros(len(vertices), dtype=bool)
+        
+        for idx in positive_y_indices:
+            # 현재 정점의 정규화된 방향 벡터
+            direction = normalized_vectors[idx]
+            
+            # Y축 성분이 충분히 강한지 확인 (수직에 가까운 점 필터링)
+            if direction[1] < 0.2:  # Y 성분이 작으면 너무 수평임
+                continue
+                
+            # XY 평면에 투영 - X축 대비 각도 계산
+            xy_proj = np.array([direction[0], direction[1], 0])
+            xy_norm = np.linalg.norm(xy_proj)
+            
+            if xy_norm > 1e-6:  # 0 벡터 방지
+                xy_proj_norm = xy_proj / xy_norm
+                # X 각도 계산 (-π ~ π)
+                angle_x = np.degrees(np.arctan2(xy_proj_norm[1], xy_proj_norm[0]) - np.pi/2)
+                # -90도로 조정 (Y축이 기준)
+                if angle_x < -90:
+                    angle_x += 360
+                
+                # 각도 절대값 변환 (좌우 대칭)
+                angle_x = abs(angle_x)
+                
+                # YZ 평면에 투영 - Z축 대비 각도 계산
+                yz_proj = np.array([0, direction[1], direction[2]])
+                yz_norm = np.linalg.norm(yz_proj)
+                
+                if yz_norm > 1e-6:  # 0 벡터 방지
+                    yz_proj_norm = yz_proj / yz_norm
+                    # Z 각도 계산
+                    angle_z = np.degrees(np.arctan2(yz_proj_norm[1], yz_proj_norm[2]) - np.pi/2)
+                    # -90도로 조정 (Y축이 기준)
+                    if angle_z < -90:
+                        angle_z += 360
+                    
+                    # 각도 절대값 변환 (상하 대칭)
+                    angle_z = abs(angle_z)
+                    
+                    # 단순히 각도 범위 내에 있는지 확인 (절대값 사용)
+                    x_in_range = angle_x <= max(abs(angle_range_x[0]), abs(angle_range_x[1]))
+                    z_in_range = angle_z <= max(abs(angle_range_z[0]), abs(angle_range_z[1]))
+                    
+                    # 둘 다 범위 내에 있으면 선택
+                    if x_in_range and z_in_range:
+                        in_range[idx] = True
+        
+        # 더 직관적인 방법: 원뿔 방정식 활용
+        cone_mask = np.zeros(len(vertices), dtype=bool)
+        cone_height = 1.0  # 정규화된 벡터이므로 높이는 1
+        
+        # X, Z 각도 최대값
+        max_angle_x = max(abs(angle_range_x[0]), abs(angle_range_x[1]))
+        max_angle_z = max(abs(angle_range_z[0]), abs(angle_range_z[1]))
+        
+        # 원뿔 형태를 현실적으로 조정
+        cone_factor = 2.0  # 원뿔 각도를 약간 넓혀줌
+        
+        # 양의 Y 방향에 있는 정점만 처리 (성능 최적화)
+        for idx in positive_y_indices:
+            # 현재 정점의 정규화된 방향 벡터
+            v = normalized_vectors[idx]
+            
+            # Y 성분이 충분히 크면 (기본 필터링)
+            if v[1] > 0.1:  # Y 방향 임계값
+                # 원뿔 각도 검사: Y축 기준 X, Z 방향 각도
+                angle_from_y = np.degrees(np.arccos(np.clip(v[1], -1.0, 1.0)))
+                
+                # X와 Z 성분으로 각도 계산
+                # X 방향 각도
+                if abs(v[0]) > 1e-6:
+                    ratio_x = abs(v[0] / v[1])  # Y에 대한 X의 비율
+                    angle_x = np.degrees(np.arctan(ratio_x))
+                else:
+                    angle_x = 0.0
+                    
+                # Z 방향 각도
+                if abs(v[2]) > 1e-6:
+                    ratio_z = abs(v[2] / v[1])  # Y에 대한 Z의 비율
+                    angle_z = np.degrees(np.arctan(ratio_z))
+                else:
+                    angle_z = 0.0
+                
+                # 각도 범위 내에 있는지 확인 (여유있게 적용)
+                x_in_range = angle_x <= (max_angle_x * cone_factor)
+                z_in_range = angle_z <= (max_angle_z * cone_factor)
+                
+                if x_in_range and z_in_range:
+                    cone_mask[idx] = True
+        
+        # 두 방법 중 하나라도 True이면 최종 선택
+        region_mask = np.logical_or(in_range, cone_mask)
+        
+        # 결과가 없는 경우 원뿔 각도를 확장하여 다시 시도
+        if np.sum(region_mask) == 0:
+            print("[로그] 첫 시도에서 선택된 정점이 없어 원뿔 각도를 확장하여 재시도합니다.")
+            # 원뿔 각도를 크게 확장
+            expanded_cone_mask = np.zeros(len(vertices), dtype=bool)
+            enlarged_factor = 3.0  # 원뿔 각도를 크게 확장
+            
+            for idx in positive_y_indices:
+                v = normalized_vectors[idx]
+                if v[1] > 0.05:  # 더 관대한 Y 방향 임계값
+                    # 원뿔 각도 확인 (매우 관대하게)
+                    angle_from_y = np.degrees(np.arccos(np.clip(v[1], -1.0, 1.0)))
+                    
+                    # 확장된 원뿔 각도 범위 내에 있는지 확인
+                    if angle_from_y <= max(max_angle_x, max_angle_z) * enlarged_factor:
+                        expanded_cone_mask[idx] = True
+            
+            region_mask = expanded_cone_mask
+            print(f"[로그] 확장된 원뿔 각도로 {np.sum(region_mask)}개 정점 선택")
+        
+        n_selected = np.sum(region_mask)
+        print(f"[로그] 원뿔 내부 점 개수: {n_selected}")
+        
+        # 너무 많은 점이 선택된 경우 필터링 (선택적)
+        if n_selected > 10000:
+            print(f"[로그] 선택된 점이 너무 많습니다. Y 방향성이 강한 점만 유지합니다.")
+            # Y 성분이 더 강한 점만 유지
+            selected_indices = np.where(region_mask)[0]
+            y_strengths = normalized_vectors[selected_indices, 1]  # Y 성분 강도
+            # 상위 50%만 유지
+            threshold = np.percentile(y_strengths, 50)
+            for i, idx in enumerate(selected_indices):
+                if y_strengths[i] < threshold:
+                    region_mask[idx] = False
+            
+            print(f"[로그] 필터링 후 정점 개수: {np.sum(region_mask)}")
+        
+        print(f"[로그] 최종 선택된 영역 정점 개수: {np.sum(region_mask)}")
+        return region_mask
+        
+    except Exception as e:
+        print(f"[오류] 각도 범위 영역 선택 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return np.zeros(len(mesh.points), dtype=bool)
+
+def visualize_region(mesh, region_mask, color=[1, 0, 0]):
+    """
+    선택된 영역을 시각화합니다.
+    
+    Args:
+        mesh: PyVista 메쉬
+        region_mask: 선택된 영역을 나타내는 불리언 마스크
+        color: 영역 색상 [r, g, b] (0-1 범위)
+        
+    Returns:
+        colored_mesh: 색상이 적용된 메쉬
+    """
+    try:
+        # 메쉬 복사
+        colored_mesh = mesh.copy()
+        
+        # 색상 배열 생성
+        colors = np.zeros((len(mesh.points), 3))
+        # 기본 색상 (회색)
+        colors[:] = [0.8, 0.8, 0.8]
+        # 선택된 영역 색상 설정
+        colors[region_mask] = color
+        
+        # 메쉬에 색상 적용
+        colored_mesh['colors'] = colors
+        
+        return colored_mesh
+        
+    except Exception as e:
+        print(f"[오류] 영역 시각화 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return mesh
+
+def find_boundary_points(mesh, region_mask, n_neighbors=10):
+    """
+    선택된 영역(region_mask)에서 외곽 경계점들을 찾습니다.
+    
+    Args:
+        mesh: PyVista 메쉬
+        region_mask: 선택된 영역을 나타내는 불리언 마스크
+        n_neighbors: 이웃 검색에 사용할 포인트 개수
+        
+    Returns:
+        boundary_indices: 경계점 인덱스 목록
+    """
+    try:
+        print("[로그] 경계점 추출 시작")
+        # 영역에 해당하는 정점 인덱스
+        region_indices = np.where(region_mask)[0]
+        
+        if len(region_indices) == 0:
+            print("[로그] 선택된 영역에 정점이 없습니다.")
+            return []
+        
+        vertices = mesh.points
+        region_vertices = vertices[region_indices]
+        
+        # KDTree를 사용하여 각 정점의 주변 정점 찾기
+        from scipy.spatial import KDTree
+        tree = KDTree(vertices)
+        
+        # 경계점 목록
+        boundary_indices = []
+        
+        for idx in region_indices:
+            # 현재 정점 좌표
+            point = vertices[idx]
+            
+            # 주변 정점 찾기
+            distances, neighbors = tree.query(point, k=n_neighbors)
+            
+            # 주변 정점 중 영역 외부에 있는 정점이 있는지 확인
+            has_outside_neighbor = False
+            for neighbor_idx in neighbors:
+                if neighbor_idx < len(region_mask) and not region_mask[neighbor_idx]:
+                    has_outside_neighbor = True
+                    break
+            
+            # 영역 외부에 있는 정점이 있으면 경계점으로 간주
+            if has_outside_neighbor:
+                boundary_indices.append(idx)
+        
+        print(f"[로그] 경계점 추출 완료: {len(boundary_indices)}개 발견")
+        return boundary_indices
+    
+    except Exception as e:
+        print(f"[오류] 경계점 추출 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def region_growing(mesh, seed_indices, max_angle_diff=35.0, max_distance=None):
+    """
+    시드 포인트에서 시작하여 유사한 법선 방향을 가진 인접 정점으로 영역을 확장합니다.
+    
+    Args:
+        mesh: PyVista 메쉬
+        seed_indices: 시작점 인덱스 목록
+        max_angle_diff: 법선 벡터 간 최대 허용 각도 차이 (도 단위)
+        max_distance: 최대 거리 제한 (None이면 제한 없음)
+        
+    Returns:
+        grown_region: 확장된 영역을 나타내는 불리언 마스크
+    """
+    try:
+        print("[로그] 영역 확장(Region Growing) 시작")
+        vertices = mesh.points
+        
+        # 법선 벡터 계산
+        # 항상 안전하게 법선 계산하는 방식으로 수정
+        print("[로그] 법선 벡터 계산 시작")
+        try:
+            # 기존 법선 벡터 확인 (point_data 사용)
+            if hasattr(mesh, 'point_data') and 'Normals' in mesh.point_data:
+                normals = mesh.point_data['Normals']
+                print("[로그] 메쉬에서 법선 벡터 정보 추출")
+            else:
+                # 법선 벡터 계산
+                mesh_copy = mesh.copy()  # 원본 메쉬 보존을 위해 복사
+                mesh_copy.compute_normals(point_normals=True, cell_normals=False, inplace=True)
+                if hasattr(mesh_copy, 'point_data') and 'Normals' in mesh_copy.point_data:
+                    normals = mesh_copy.point_data['Normals']
+                else:
+                    # 직접 계산 시도
+                    print("[로그] 법선 직접 계산 시도")
+                    # 임시 방편으로 단순한 법선 계산 (매우 기본적인 방식)
+                    normals = np.zeros_like(vertices)
+                    for i in range(len(vertices)):
+                        # 기본 법선값으로 외곽 방향 사용
+                        normal = vertices[i] - np.mean(vertices, axis=0)
+                        norm = np.linalg.norm(normal)
+                        if norm > 0:
+                            normals[i] = normal / norm
+                        else:
+                            normals[i] = np.array([0, 1, 0])  # 기본값
+                
+                print("[로그] 법선 벡터 계산 완료")
+        except Exception as e:
+            print(f"[오류] 법선 벡터 계산 중 오류: {e}")
+            # 오류 발생 시 기본 법선 벡터 생성
+            normals = np.zeros_like(vertices)
+            for i in range(len(vertices)):
+                normal = vertices[i] - np.mean(vertices, axis=0)
+                norm = np.linalg.norm(normal)
+                if norm > 0:
+                    normals[i] = normal / norm
+                else:
+                    normals[i] = np.array([0, 1, 0])  # 기본값
+            print("[로그] 기본 법선 벡터 생성 완료")
+        
+        # 법선 벡터 정규화
+        norms = np.linalg.norm(normals, axis=1)
+        norms[norms == 0] = 1.0  # 0으로 나누기 방지
+        normals = normals / norms.reshape(-1, 1)
+        
+        # 메쉬 크기 기반 거리 기준 설정 (명시적 값이 없는 경우)
+        if max_distance is None:
+            max_distance = np.ptp(vertices, axis=0).max() * 0.02  # 모델 크기의 2%
+            print(f"[로그] 최대 거리 기준 자동 설정: {max_distance}")
+        
+        # KDTree를 사용하여 각 정점의 주변 정점 찾기
+        from scipy.spatial import KDTree
+        tree = KDTree(vertices)
+        
+        # 성장된 영역을 저장할 불리언 마스크
+        grown_region = np.zeros(len(vertices), dtype=bool)
+        
+        # 시드 포인트가 없으면 빈 결과 반환
+        if len(seed_indices) == 0:
+            print("[로그] 시드 포인트가 없습니다. 빈 결과 반환.")
+            return grown_region
+        
+        # 처리할 정점 목록 (seed_indices에서 시작)
+        queue = list(seed_indices)
+        # 처리할 정점에 대한 마킹 (중복 방지)
+        in_queue = np.zeros(len(vertices), dtype=bool)
+        in_queue[seed_indices] = True
+        
+        # 시드 포인트는 이미 영역에 포함
+        grown_region[seed_indices] = True
+        
+        # 시드 포인트들의 평균 법선 벡터
+        avg_normal = np.mean(normals[seed_indices], axis=0)
+        norm_avg = np.linalg.norm(avg_normal)
+        if norm_avg > 0:
+            avg_normal = avg_normal / norm_avg
+        else:
+            # 평균 법선이 0이면 기본값 사용
+            avg_normal = np.array([0, 1, 0])
+        
+        # 영역 확장
+        processed_count = 0
+        while queue:
+            current_idx = queue.pop(0)
+            processed_count += 1
+            
+            # 주변 정점 찾기
+            distances, neighbors = tree.query(vertices[current_idx], k=min(20, len(vertices)))
+            
+            for i, neighbor_idx in enumerate(neighbors):
+                # 이미 처리한 정점은 건너뜀
+                if neighbor_idx >= len(vertices) or grown_region[neighbor_idx] or in_queue[neighbor_idx]:
+                    continue
+                
+                # 거리 체크
+                if distances[i] > max_distance:
+                    continue
+                
+                # 법선 벡터 유사도 체크
+                neighbor_normal = normals[neighbor_idx]
+                # 코사인 유사도 (두 벡터의 내적)
+                similarity = np.dot(avg_normal, neighbor_normal)
+                # 아크코사인을 사용하여 각도로 변환 (라디안)
+                angle_diff = np.degrees(np.arccos(np.clip(similarity, -1.0, 1.0)))
+                
+                # 최대 각도 차이 이내인 경우 영역에 포함
+                if angle_diff <= max_angle_diff:
+                    grown_region[neighbor_idx] = True
+                    queue.append(neighbor_idx)
+                    in_queue[neighbor_idx] = True
+            
+            # 로깅 (진행 상황)
+            if processed_count % 100 == 0:
+                print(f"[로그] 영역 확장 진행 중: {processed_count}개 정점 처리, 현재 영역 크기: {np.sum(grown_region)}")
+        
+        print(f"[로그] 영역 확장 완료: 총 {np.sum(grown_region)}개 정점 포함")
+        return grown_region
+        
+    except Exception as e:
+        print(f"[오류] 영역 확장(Region Growing) 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return np.zeros(len(mesh.points), dtype=bool)
+
 def main():
     try:
         print("[로그] 메인 함수 실행 시작")
@@ -563,15 +991,55 @@ def main():
         add_meshs(p, [y_aligned_mesh, y_aligned_obb], "Y-Aligned Mesh", 1, color='lightblue')
         print("[로그] Y축 방향 정렬된 메쉬 시각화 완료")
         
-        # 3. +Y 방향 외곽점을 찾기만 하고 메쉬는 이동시키지 않음
+        # 3. +Y 방향 외곽점을 찾기
         print("[로그] +Y 방향 외곽점 찾기 시작")
         _, edge_point = align_to_edge_point(y_aligned_mesh)  # 메쉬는 변경하지 않음, 외곽점만 구함
         print("[로그] +Y 방향 외곽점 찾기 완료")
         
+        # 4. Y축 방향 기준으로 각도 범위 내의 영역 선택
+        print("[로그] Y축 방향 기준 각도 범위 영역 선택 시작")
+        angle_range_x = (-25, 25)   # X축 기준 각도 범위 (±25도)
+        angle_range_z = (-5, 5)     # Z축 기준 각도 범위 (±5도)
+        region_mask = select_region_by_angle(y_aligned_mesh, angle_range_x, angle_range_z)
+        print("[로그] 각도 범위 영역 선택 완료")
+        
+        # 5. 선택된 영역의 경계점 찾기
+        print("[로그] 선택된 영역의 경계점 찾기 시작")
+        boundary_indices = find_boundary_points(y_aligned_mesh, region_mask, n_neighbors=15)
+        print("[로그] 경계점 찾기 완료")
+        
+        # 6. 경계점에서 region growing 시작
+        print("[로그] 경계점에서 Region Growing 시작")
+        grown_region = region_growing(y_aligned_mesh, boundary_indices)
+        print("[로그] Region Growing 완료")
+        
+        # 영역 시각화
+        print("[로그] 선택된 영역 시각화 시작")
+        colored_mesh = visualize_region(y_aligned_mesh, region_mask, color=[0, 1, 1])  # 청록색으로 영역 표시
+        
+        # 영역이 선택된 메쉬 표시 (서브플롯 2)
+        p.subplot(1, 0)
+        p.add_mesh(colored_mesh, scalars='colors', rgb=True)
+        p.add_text("Selected Region", font_size=14)
+        print("[로그] 선택된 영역 시각화 완료")
+        
+        # Region Growing 결과 시각화
+        # print("[로그] Region Growing 결과 시각화 시작")
+        # grown_mesh = visualize_region(y_aligned_mesh, grown_region, color=[1, 0.5, 0])  # 주황색으로 영역 표시
+        # p.subplot(0, 1)
+        # p.add_mesh(grown_mesh, scalars='colors', rgb=True)
+        # print("[로그] Region Growing 결과 시각화 완료")
+        
+        # 경계점 시각화
+        if boundary_indices:
+            boundary_points = y_aligned_mesh.points[boundary_indices]
+            boundary_cloud = pv.PolyData(boundary_points)
+            p.subplot(0, 1)
+            p.add_mesh(boundary_cloud, color='red', point_size=8, render_points_as_spheres=True)
+            print("[로그] 경계점 시각화 완료")
+        
         # 외곽점 찾은 결과를 시각화
         print("[로그] 외곽점 시각화 시작")
-        # Y축 정렬된 메쉬와 OBB를 두 번째 subplot에 표시
-        add_meshs(p, [y_aligned_mesh, y_aligned_obb], "Y-Aligned with Edge Point", 2, color='lightgreen')
         
         # 시각화를 위한 외곽점 마커 추가
         try:
@@ -587,8 +1055,78 @@ def main():
             p.subplot(1, 0)
             p.add_mesh(ray_line, color='yellow', line_width=3)
             
-            # 두 번째 subplot에도 레이와 외곽점 추가
-            p.subplot(1, 0)
+            # 각도 범위 시각화 (원뿔 또는 사각뿔)
+            try:
+                print(f"[로그] 각도 범위 시각화 시작: X {angle_range_x}도, Z {angle_range_z}도")
+                
+                # 원뿔 높이
+                cone_height = ray_length
+                
+                # 무게중심에 작은 구 추가 (무게중심 시각화)
+                center_sphere = pv.Sphere(center=weight_center, radius=ray_length/40)
+                p.subplot(1, 0)
+                p.add_mesh(center_sphere, color='green')
+                print("[로그] 무게중심 시각화 추가")
+                
+                # 원뿔 생성 (PyVista를 사용한 방법)
+                # y 방향으로 정렬된 원뿔 생성
+                max_angle = max(max(abs(angle_range_x[0]), abs(angle_range_x[1])), 
+                               max(abs(angle_range_z[0]), abs(angle_range_z[1])))
+                # 각도에서 원뿔 반지름 계산 (삼각함수 이용)
+                cone_radius = cone_height * np.tan(np.radians(max_angle))
+                
+                # 원뿔 생성
+                cone = pv.Cone(center=weight_center + ray_direction * (cone_height/2),
+                              direction=ray_direction,
+                              height=cone_height,
+                              radius=cone_radius,
+                              resolution=30)
+                
+                # 원뿔을 정확한 각도로 절단하여 사용할 경우를 위한 준비
+                # 타원형 원뿔 생성 (X, Z 각도가 다를 경우)
+                if abs(angle_range_x[0]) != abs(angle_range_z[0]) or abs(angle_range_x[1]) != abs(angle_range_z[1]):
+                    # 보다 복잡한 형태가 필요한 경우 수동으로 각 포인트 생성
+                    cone_points = []
+                    # 원점
+                    cone_points.append(weight_center)
+                    
+                    # 바닥면 포인트 (타원형)
+                    n_points = 36  # 가장자리 포인트 개수
+                    angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
+                    
+                    # X, Z 방향 반지름 (각각의 각도 범위에 따라 다름)
+                    x_radius = cone_height * np.tan(np.radians(max(abs(angle_range_x[0]), abs(angle_range_x[1]))))
+                    z_radius = cone_height * np.tan(np.radians(max(abs(angle_range_z[0]), abs(angle_range_z[1]))))
+                    
+                    for angle in angles:
+                        # 타원형 바닥면 좌표 계산
+                        x = x_radius * np.cos(angle)
+                        z = z_radius * np.sin(angle)
+                        # 원뿔 높이만큼 y 방향으로 이동
+                        point = weight_center + np.array([x, cone_height, z])
+                        cone_points.append(point)
+                    
+                    # 포인트 클라우드로 변환
+                    cone_cloud = pv.PolyData(np.array(cone_points))
+                    
+                    # 볼록 껍질 생성
+                    custom_cone = cone_cloud.delaunay_3d().extract_surface()
+                    
+                    # 반투명 원뿔 추가
+                    p.subplot(1, 0)
+                    p.add_mesh(custom_cone, color='yellow', opacity=0.2)
+                    print("[로그] 커스텀 타원형 원뿔 시각화 완료")
+                else:
+                    # 반투명 원뿔 추가
+                    p.subplot(1, 0)
+                    p.add_mesh(cone, color='yellow', opacity=0.2)
+                    print("[로그] 원형 원뿔 시각화 완료")
+                
+                print("[로그] 각도 범위 시각화 완료")
+            except Exception as e:
+                print(f"[오류] 각도 범위 시각화 중 오류: {e}")
+                import traceback
+                traceback.print_exc()
             
             # 외곽점 표시
             if edge_point is not None and not np.array_equal(edge_point, np.zeros(3)):
@@ -602,13 +1140,27 @@ def main():
                 print("[로그] 레이와 외곽점 시각화 추가 완료")
         except Exception as e:
             print(f"[오류] 레이 시각화 중 오류: {e}")
+            import traceback
+            traceback.print_exc()
         
         # 통합 함수로 한번에 변환
         print("[로그] 통합 변환 함수 실행 시작")
         transformed_mesh, transformation_info = transform_mesh(mesh)
         transformed_obb = get_obb(transformed_mesh)
         print("[로그] 최종 변환된 메쉬 시각화 시작")
-        add_meshs(p, [transformed_mesh, transformed_obb], "Y-Aligned Final", 3, color='coral')
+        
+        # 최종 변환된 메쉬에도 모든 작업 적용 및 결합 결과 표시
+        region_mask_final = select_region_by_angle(transformed_mesh, angle_range_x, angle_range_z)
+        boundary_indices_final = find_boundary_points(transformed_mesh, region_mask_final, n_neighbors=15)
+        grown_region_final = region_growing(transformed_mesh, boundary_indices_final)
+        
+        # 최종 결과 시각화 (선택 영역 + Region Growing 결과)
+        final_mask = np.logical_or(region_mask_final, grown_region_final)
+        final_colored_mesh = visualize_region(transformed_mesh, final_mask, color=[0, 0.8, 0.8])
+        
+        p.subplot(1, 1)
+        p.add_mesh(final_colored_mesh, scalars='colors', rgb=True)
+        p.add_text("Final Result with Region Growing", font_size=14)
         print("[로그] 최종 변환된 메쉬 시각화 완료")
         
         # 변환 정보 출력
@@ -616,6 +1168,9 @@ def main():
         print(f"통합 함수 Y축 회전 필요: {transformation_info['need_y_rotation']}")
         if 'edge_point' in transformation_info:
             print(f"외곽점 좌표: {transformation_info['edge_point']}")
+        print(f"선택된 영역 정점 개수: {np.sum(region_mask)}")
+        print(f"영역 확장 후 정점 개수: {np.sum(grown_region)}")
+        print(f"최종 영역 정점 개수: {np.sum(final_mask)}")
         
         # 시각화 부분 수정
         print("[로그] 시각화 표시 시작")
