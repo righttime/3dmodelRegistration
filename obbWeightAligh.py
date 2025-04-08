@@ -2,6 +2,7 @@ import open3d as o3d
 import numpy as np
 import copy
 import os
+import time
 from datetime import datetime
 
 def ray_triangle_intersection(ray_origin, ray_direction, v0, v1, v2, epsilon=1e-6):
@@ -45,7 +46,7 @@ def ray_triangle_intersection(ray_origin, ray_direction, v0, v1, v2, epsilon=1e-
 
 def find_ray_mesh_intersection(mesh, ray_origin, ray_direction):
     """
-    메쉬와 레이의 모든 교차점 찾기
+    메쉬와 레이의 모든 교차점 찾기 (정확하지만 느림)
     """
     vertices = np.asarray(mesh.vertices)
     triangles = np.asarray(mesh.triangles)
@@ -69,9 +70,54 @@ def find_ray_mesh_intersection(mesh, ray_origin, ray_direction):
     
     return []
 
+def find_ray_mesh_intersection_approximate(mesh, ray_origin, ray_direction, max_distance_from_ray=5.0):
+    """
+    근사적인 레이캐스팅 (빠르지만 정확도 개선)
+    실제 레이 경로 상 또는 가까이에 있는 정점 중 가장 먼 점을 찾음
+    max_distance_from_ray: 레이에서 이 거리 이내에 있는 점들만 고려 (단위: 모델 스케일)
+    """
+    vertices = np.asarray(mesh.vertices)
+    
+    # 레이 방향 벡터 정규화
+    ray_direction = ray_direction / np.linalg.norm(ray_direction)
+    
+    # 각 정점에서 레이 원점까지의 벡터
+    vec_to_points = vertices - ray_origin
+    
+    # 레이 방향으로의 투영 거리 계산
+    projections = np.dot(vec_to_points, ray_direction)
+    
+    # 투영 값이 양수인 점만 선택 (레이 방향에 있는 점)
+    valid_indices = np.where(projections > 0)[0]
+    
+    if len(valid_indices) > 0:
+        # 유효한 정점들
+        valid_vertices = vertices[valid_indices]
+        valid_projections = projections[valid_indices]
+        
+        # 레이에서 각 정점까지의 최단 거리 계산
+        # 공식: ||(p - o) - ((p - o)·d)d|| 여기서 p는 정점, o는 레이 원점, d는 레이 방향 벡터
+        projection_points = ray_origin + ray_direction.reshape(1, 3) * valid_projections.reshape(-1, 1)
+        distances_from_ray = np.linalg.norm(valid_vertices - projection_points, axis=1)
+        
+        # 레이에서 max_distance_from_ray 이내에 있는 점들만 필터링
+        near_ray_indices = np.where(distances_from_ray <= max_distance_from_ray)[0]
+        
+        if len(near_ray_indices) > 0:
+            # 레이에 가까우면서 레이 방향으로 가장 먼 점 찾기
+            filtered_indices = valid_indices[near_ray_indices]
+            max_proj_idx = filtered_indices[np.argmax(projections[filtered_indices])]
+            return [vertices[max_proj_idx]]
+    
+    return []
+
 def main():
     # Transformed 3D 모델 파일 경로
     model_path = "assets/data/transformed/transformed_model_20250408_091623.stl"
+    
+    # 레이캐스팅 방식 선택
+    # 0: 정확한 방식(느림), 1: 근사적 방식(빠름)
+    raycasting_method = 1
     
     # 메쉬 로드
     print(f"=== 메쉬 로딩 시작 ===")
@@ -144,38 +190,76 @@ def main():
     
     # 5. 무게중심에서 y축 방향으로 레이캐스팅하여 마지막에 맞은 외곽점 찾기
     print(f"=== 레이캐스팅 시작 ===")
-    ray_origin = center_of_mass
-    ray_direction = y_axis  # y축 방향
     
-    # 레이와 메쉬 교차점 계산
-    intersections = find_ray_mesh_intersection(mesh, ray_origin, ray_direction)
+    # 레이캐스팅 방식에 따른 설명
+    method_names = ["정확한 방식 (느림)", "근사적 방식 (빠름)"]
+    print(f"레이캐스팅 방식: {method_names[raycasting_method]}")
     
-    if intersections:
-        # 가장 마지막 교차점이 원점이 됨 (가장 먼 교차점)
-        edge_point = intersections[-1]
-        print(f"레이캐스팅 결과 - 외곽점: {edge_point}")
+    # OBB 중심과 무게중심의 y축 관계에 따라 초기 레이 방향 결정
+    # OBB 중심의 y 좌표가 무게중심의 y 좌표보다 크면 -y 방향으로, 아니면 +y 방향으로 쏨
+    obb_center_projection = np.dot(obb_center - center_of_mass, y_axis)
+    
+    if obb_center_projection > 0:
+        initial_ray_direction = -y_axis  # -y축 방향
+        print("OBB 중심이 무게중심보다 +y축 방향에 있어 -y축 방향으로 레이캐스팅을 시작합니다.")
     else:
-        # 교차점이 없으면 반대 방향으로 시도
-        print("양의 y축 방향으로 교차점이 없습니다. 음의 y축 방향으로 시도합니다.")
-        ray_direction = -y_axis
+        initial_ray_direction = y_axis  # +y축 방향
+        print("OBB 중심이 무게중심보다 -y축 방향에 있어 +y축 방향으로 레이캐스팅을 시작합니다.")
+    
+    start_time = time.time()
+    ray_origin = center_of_mass
+    ray_direction = initial_ray_direction.copy()
+    
+    # 레이캐스팅 방식에 따라 외곽점 계산
+    if raycasting_method == 0:  # 정확한 방식
         intersections = find_ray_mesh_intersection(mesh, ray_origin, ray_direction)
         
         if intersections:
-            edge_point = intersections[-1]
-            print(f"레이캐스팅 결과 - 외곽점: {edge_point}")
+            edge_point = intersections[-1]  # 마지막 교차점
         else:
-            # 여전히 교차점이 없으면 기존 방식으로 외곽점 찾기
-            print("레이캐스팅으로 외곽점을 찾지 못했습니다. 투영 방식을 사용합니다.")
-            y_projections = np.dot(vertices - center_of_mass, y_axis)
-            max_idx = np.argmax(y_projections)
-            edge_point = vertices[max_idx]
+            # 반대 방향으로 시도
+            print(f"첫 번째 방향으로 교차점이 없습니다. 반대 방향으로 시도합니다.")
+            ray_direction = -ray_direction
+            intersections = find_ray_mesh_intersection(mesh, ray_origin, ray_direction)
+            
+            if intersections:
+                edge_point = intersections[-1]
+            else:
+                # 투영 방식 사용
+                print("레이캐스팅으로 외곽점을 찾지 못했습니다. 투영 방식을 사용합니다.")
+                y_projections = np.dot(vertices - center_of_mass, y_axis)
+                max_idx = np.argmax(y_projections)
+                edge_point = vertices[max_idx]
+                ray_direction = initial_ray_direction  # 원래 방향으로 복원
+                
+    else:  # 근사적 방식 (방법 1)
+        intersections = find_ray_mesh_intersection_approximate(mesh, ray_origin, ray_direction)
+        
+        if intersections:
+            edge_point = intersections[-1]
+        else:
+            # 반대 방향으로 시도
+            print(f"첫 번째 방향으로 교차점이 없습니다. 반대 방향으로 시도합니다.")
+            ray_direction = -ray_direction
+            intersections = find_ray_mesh_intersection_approximate(mesh, ray_origin, ray_direction)
+            
+            if intersections:
+                edge_point = intersections[-1]
+            else:
+                # 투영 방식 사용
+                print("레이캐스팅으로 외곽점을 찾지 못했습니다. 투영 방식을 사용합니다.")
+                y_projections = np.dot(vertices - center_of_mass, y_axis)
+                max_idx = np.argmax(y_projections)
+                edge_point = vertices[max_idx]
+                ray_direction = initial_ray_direction  # 원래 방향으로 복원
     
+    end_time = time.time()
     print(f"y축 방향 외곽점: {edge_point}")
+    print(f"레이캐스팅 시간: {end_time - start_time:.4f}초")
     
     # 레이 시각화를 위한 선분 생성
-    ray_length = np.linalg.norm(edge_point - ray_origin) * 1.2  # 좀 더 길게 표시
-    ray_end = ray_origin + ray_direction * ray_length
-    ray_points = np.vstack((ray_origin, ray_end))
+    # 무게중심에서 외곽점으로 직접 선을 그림 (ray_direction과 무관하게)
+    ray_points = np.vstack((ray_origin, edge_point))
     ray_lines = np.array([[0, 1]])  # 0번과 1번 점 연결
     
     ray_line_set = o3d.geometry.LineSet()
@@ -301,9 +385,10 @@ def main():
     output_dir = "assets/data/aligned"
     os.makedirs(output_dir, exist_ok=True)
     
-    # 현재 시간을 사용하여 고유한 파일 이름 생성
+    # 현재 시간과 레이캐스팅 방식을 파일 이름에 포함
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(output_dir, f"aligned_model_{timestamp}.stl")
+    method_suffix = ["accurate", "approx"][raycasting_method]
+    output_path = os.path.join(output_dir, f"aligned_model_{method_suffix}_{timestamp}.stl")
     
     # STL 파일로 저장
     print(f"=== 변환된 메쉬 저장 ===")
