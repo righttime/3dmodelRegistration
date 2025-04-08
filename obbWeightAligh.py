@@ -303,6 +303,237 @@ def visualize_region(mesh, region_vertices, color=[0, 1, 1]):
     
     return region_mesh
 
+def select_seed_region(mesh, center_point, normal_vector, x_axis, z_axis, x_angle_range=(-20, 20), z_angle_range=(-10, 10), max_distance=50.0):
+    """
+    중심점에서 지정된 각도 범위 내에 있는 정점들을 선택합니다.
+    
+    Args:
+        mesh: 메쉬 데이터
+        center_point: 중심점 (외곽점)
+        normal_vector: 중심점의 법선 벡터 (보통 y축)
+        x_axis: x축 방향 벡터
+        z_axis: z축 방향 벡터
+        x_angle_range: x축 기준 각도 범위 (도), 튜플 (최소, 최대)
+        z_angle_range: z축 기준 각도 범위 (도), 튜플 (최소, 최대)
+        max_distance: 중심점에서 최대 거리
+        
+    Returns:
+        선택된 정점 인덱스 목록
+    """
+    vertices = mesh.points
+    
+    # 선택된 정점 인덱스를 저장할 집합
+    selected_indices = set()
+    
+    # 각도 범위를 라디안으로 변환
+    x_rad_range = (np.radians(x_angle_range[0]), np.radians(x_angle_range[1]))
+    z_rad_range = (np.radians(z_angle_range[0]), np.radians(z_angle_range[1]))
+    
+    print(f"각도 범위 - X: {x_angle_range}도, Z: {z_angle_range}도")
+    print(f"중심점: {center_point}")
+    
+    # 각 정점에 대해 각도 및 거리 계산
+    for i, vertex in enumerate(vertices):
+        # 중심점에서 정점으로의 벡터
+        direction = vertex - center_point
+        
+        # 거리 계산
+        distance = np.linalg.norm(direction)
+        
+        # 최대 거리를 초과하면 건너뜀
+        if distance > max_distance:
+            continue
+        
+        # 방향 벡터 정규화
+        if distance > 1e-10:  # 0으로 나누기 방지
+            direction = direction / distance
+        else:
+            continue  # 중심점과 같은 점은 건너뜀
+        
+        # x축 기준 각도 계산
+        x_projection = np.dot(direction, x_axis)
+        y_projection = np.dot(direction, normal_vector)
+        xz_norm = np.sqrt(x_projection**2 + y_projection**2)
+        if xz_norm > 1e-10:
+            x_angle = np.arctan2(y_projection, x_projection)
+        else:
+            x_angle = 0
+        
+        # z축 기준 각도 계산
+        z_projection = np.dot(direction, z_axis)
+        y_projection = np.dot(direction, normal_vector)
+        yz_norm = np.sqrt(z_projection**2 + y_projection**2)
+        if yz_norm > 1e-10:
+            z_angle = np.arctan2(y_projection, z_projection)
+        else:
+            z_angle = 0
+        
+        # 각도 범위 내에 있는지 확인
+        if x_rad_range[0] <= x_angle <= x_rad_range[1] and z_rad_range[0] <= z_angle <= z_rad_range[1]:
+            selected_indices.add(i)
+    
+    print(f"각도 범위 내 선택된 정점 수: {len(selected_indices)}")
+    return list(selected_indices)
+
+def multi_seed_region_growing(mesh, seed_points, max_angle_diff=90.0, max_distance=150.0):
+    """
+    여러 시드 포인트를 동시에 사용하는 리전 그로잉
+    
+    Args:
+        mesh: 메쉬 데이터
+        seed_points: 시드 포인트들의 좌표 리스트
+        max_angle_diff: 법선 벡터 최대 각도 차이 (도)
+        max_distance: 중심점으로부터 최대 거리
+        
+    Returns:
+        리전에 포함된 정점 인덱스 리스트
+    """
+    vertices = mesh.points
+    
+    # PyVista 메쉬에서 삼각형 추출
+    triangles = mesh.faces.reshape(-1, 4)[:, 1:4]
+    
+    # 정점 법선 계산
+    vertex_normals = compute_vertex_normals(vertices, triangles)
+    
+    # 메쉬 정점 간 인접성 그래프 구축 (직접적으로 연결된 정점들)
+    adjacency = [set() for _ in range(len(vertices))]
+    for tri in triangles:
+        adjacency[tri[0]].add(tri[1])
+        adjacency[tri[0]].add(tri[2])
+        adjacency[tri[1]].add(tri[0])
+        adjacency[tri[1]].add(tri[2])
+        adjacency[tri[2]].add(tri[0])
+        adjacency[tri[2]].add(tri[1])
+    
+    print(f"인접성 그래프 구축 완료")
+    
+    # 시드 포인트들 중 하나를 기준점으로 사용 (첫 번째 시드)
+    reference_point = seed_points[0]
+    
+    # 리전 그로잉 초기화
+    region = set()
+    visited = set()
+    queue = []
+    
+    # 모든 시드 포인트에 가장 가까운 정점 찾기
+    seed_vertices = []
+    for seed_point in seed_points:
+        distances = np.linalg.norm(vertices - seed_point, axis=1)
+        seed_idx = np.argmin(distances)
+        seed_vertices.append(seed_idx)
+    
+    print(f"시드 정점 수: {len(seed_vertices)}")
+    
+    # 모든 시드 정점을 초기 큐에 추가
+    for seed_idx in seed_vertices:
+        if seed_idx not in visited and len(adjacency[seed_idx]) > 0:
+            visited.add(seed_idx)
+            region.add(seed_idx)
+            queue.append(seed_idx)
+    
+    print(f"초기 큐에 {len(queue)}개 시드 정점 추가됨")
+    
+    # 각도 임계값 계산
+    cos_threshold = np.cos(np.radians(max_angle_diff))
+    print(f"리전 그로잉 시작: 최대 각도 차이 {max_angle_diff}도 (cos {cos_threshold:.4f}), 최대 거리 {max_distance}")
+    
+    # BFS 기반 리전 그로잉
+    iteration = 0
+    last_region_size = len(region)
+    
+    while queue:
+        current_idx = queue.pop(0)  # FIFO 방식으로 pop
+        current_normal = vertex_normals[current_idx]
+        
+        # 현재 정점과 직접 연결된 모든 정점 탐색
+        for neighbor_idx in adjacency[current_idx]:
+            if neighbor_idx in visited:
+                continue
+            
+            # 거리 조건 확인 (선택적)
+            if max_distance > 0:
+                vertex_distance = np.linalg.norm(vertices[neighbor_idx] - reference_point)
+                if vertex_distance > max_distance:
+                    continue
+            
+            # 이웃 정점의 법선
+            neighbor_normal = vertex_normals[neighbor_idx]
+            
+            # 법선 각도 계산 (절대값을 사용하여 방향성 무시)
+            cos_angle = abs(np.dot(current_normal, neighbor_normal))
+            
+            # 각도 조건 확인
+            if cos_angle >= cos_threshold:
+                visited.add(neighbor_idx)
+                queue.append(neighbor_idx)
+                region.add(neighbor_idx)
+        
+        # 로깅: 리전 크기가 크게 변하면 출력
+        iteration += 1
+        if iteration % 1000 == 0 or len(region) - last_region_size >= 100:
+            print(f"반복 {iteration}, 현재 리전 크기: {len(region)}개 정점 ({len(region) - last_region_size}개 추가)")
+            last_region_size = len(region)
+    
+    print(f"리전 그로잉 완료: {len(region)}개 정점 포함")
+    
+    # 리전이 너무 작으면 거리 기준으로 정점 추가
+    if len(region) < 100:
+        print(f"리전이 너무 작습니다. 가장 가까운 정점 100개를 추가합니다.")
+        distances = np.linalg.norm(vertices - reference_point, axis=1)
+        close_vertices = np.argsort(distances)[:100]
+        region.update(close_vertices)
+        print(f"확장 후 리전 크기: {len(region)}개 정점")
+    
+    return list(region)
+
+def get_obb(mesh):
+    """
+    PyVista 메쉬의 OBB(Oriented Bounding Box)를 계산합니다.
+    PCA 기반 방식으로 메쉬의 주축을 찾아 OBB를 계산합니다.
+    
+    Args:
+        mesh: PyVista 메쉬
+        
+    Returns:
+        obb_center: OBB 중심 좌표
+        obb_axes: OBB의 주축 (3x3 회전 행렬)
+        obb_extents: OBB의 각 축 방향 크기
+    """
+    vertices = mesh.points
+    
+    # 점들의 평균 계산 (OBB 중심)
+    mean_pt = np.mean(vertices, axis=0)
+    
+    # 평균을 중심으로 점들을 이동
+    centered_pts = vertices - mean_pt
+    
+    # 공분산 행렬 계산
+    cov = np.cov(centered_pts, rowvar=False)
+    
+    # 고유값과 고유벡터 계산
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    
+    # 고유값이 큰 순서대로 정렬 (주축 순서대로)
+    idx = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+    
+    # OBB의 주축 (각 열이 하나의 축)
+    obb_axes = eigvecs
+    
+    # 주축 방향으로 점들 투영
+    projections = np.dot(centered_pts, obb_axes)
+    
+    # 각 축에 대한 최소/최대값 계산
+    mins = np.min(projections, axis=0)
+    maxs = np.max(projections, axis=0)
+    
+    # OBB의 크기 계산
+    obb_extents = maxs - mins
+    
+    return mean_pt, obb_axes, obb_extents
+
 def main():
     # Transformed 3D 모델 파일 경로
     model_path = "assets/data/transformed/transformed_model_20250408_091623.stl"
@@ -313,8 +544,15 @@ def main():
     
     # 리전 그로잉 파라미터
     use_region_growing = True
-    max_angle_diff = 10.8    # 법선 벡터 최대 각도 차이 (도)
-    max_distance = 10.0      # 시드 포인트에서 최대 거리 (0으로 설정하면 거리 제한 없음)
+    max_angle_diff = 10.8     # 법선 벡터 최대 각도 차이 (도)
+    max_distance = 50.0       # 시드 포인트에서 최대 거리 (0으로 설정하면 거리 제한 없음)
+    
+    # 각도 기반 시드 영역 선택 파라미터
+    use_angle_based_seeds = True
+    x_angle_range = (-20, 20)  # x축 기준 각도 범위 (도)
+    z_angle_range = (-10, 10)  # z축 기준 각도 범위 (도)
+    seed_max_distance = 50.0   # 시드 영역 최대 거리
+    max_seed_points = 20       # 사용할 최대 시드 포인트 수 (성능을 위해 제한)
     
     # 메쉬 로드
     print(f"=== 메쉬 로딩 시작 ===")
@@ -331,29 +569,7 @@ def main():
     
     # OBB (Oriented Bounding Box) 계산
     print(f"=== OBB 계산 ===")
-    # PyVista는 OBB를 직접 지원하지 않으므로 PCA를 사용하여 계산
-    mean_pt = np.mean(vertices, axis=0)
-    pts = vertices - mean_pt
-    cov = np.cov(pts, rowvar=False)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    
-    # 크기 순으로 정렬 (큰 것부터)
-    idx = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[idx]
-    eigvecs = eigvecs[:, idx]
-    
-    # OBB 회전 행렬 (각 열은 OBB의 주축)
-    obb_rotation = eigvecs
-    
-    # OBB 중심은 포인트 클라우드의 중심
-    obb_center = mean_pt
-    
-    # OBB 크기 계산
-    # 각 축에 대한 투영 거리의 최대-최소
-    projections = np.dot(pts, obb_rotation)
-    obb_mins = np.min(projections, axis=0)
-    obb_maxs = np.max(projections, axis=0)
-    obb_extent = obb_maxs - obb_mins
+    obb_center, obb_rotation, obb_extent = get_obb(mesh)
     
     # 무게중심 계산 (정점의 평균)
     center_of_mass = np.mean(vertices, axis=0)
@@ -473,9 +689,42 @@ def main():
     if use_region_growing:
         print(f"=== 리전 그로잉 시작 ===")
         start_time = time.time()
-        region_vertices = region_growing(mesh, edge_point, 
-                                         max_angle_diff=max_angle_diff, 
-                                         max_distance=max_distance)
+        
+        if use_angle_based_seeds:
+            print(f"=== 각도 기반 시드 영역 선택 ===")
+            # 외곽점의 법선 계산 (또는 근사)
+            # 간단한 근사: y축 방향 (또는 ray_direction)을 법선으로 사용
+            edge_normal = ray_direction
+            
+            # 각도 범위 내의 정점 선택
+            seed_indices = select_seed_region(
+                mesh, edge_point, edge_normal, x_axis, z_axis,
+                x_angle_range, z_angle_range, seed_max_distance
+            )
+            
+            if len(seed_indices) > 0:
+                # 시드 수가 너무 많으면 일부만 사용 (성능 향상)
+                if len(seed_indices) > max_seed_points:
+                    # 균등하게 샘플링
+                    step = len(seed_indices) // max_seed_points
+                    seed_indices = seed_indices[::step][:max_seed_points]
+                    print(f"성능을 위해 {max_seed_points}개 시드로 제한합니다.")
+                
+                # 시드 포인트 좌표 추출
+                seed_points = [vertices[idx] for idx in seed_indices]
+                print(f"선택된 {len(seed_points)}개 시드 포인트로 다중 시드 리전 그로잉 수행")
+                
+                # 다중 시드 리전 그로잉 수행
+                region_vertices = multi_seed_region_growing(
+                    mesh, seed_points, max_angle_diff, max_distance
+                )
+            else:
+                print(f"각도 범위 내 시드 정점이 없습니다. 단일 외곽점을 사용합니다.")
+                region_vertices = region_growing(mesh, edge_point, max_angle_diff, max_distance)
+        else:
+            # 기존 방식: 단일 외곽점을 시드로 사용
+            region_vertices = region_growing(mesh, edge_point, max_angle_diff, max_distance)
+        
         end_time = time.time()
         print(f"리전 그로잉 결과: {len(region_vertices)}개 정점 포함")
         print(f"리전 그로잉 시간: {end_time - start_time:.4f}초")
@@ -523,15 +772,25 @@ def main():
     
     # OBB 시각화
     corners = np.empty((8, 3))
+    
+    # 각 축 방향의 반길이
+    half_sizes = obb_extent / 2
+    
+    # 8개의 코너 좌표 계산
+    corners_local = np.array([
+        [-half_sizes[0], -half_sizes[1], -half_sizes[2]],
+        [half_sizes[0], -half_sizes[1], -half_sizes[2]],
+        [half_sizes[0], half_sizes[1], -half_sizes[2]],
+        [-half_sizes[0], half_sizes[1], -half_sizes[2]],
+        [-half_sizes[0], -half_sizes[1], half_sizes[2]],
+        [half_sizes[0], -half_sizes[1], half_sizes[2]],
+        [half_sizes[0], half_sizes[1], half_sizes[2]],
+        [-half_sizes[0], half_sizes[1], half_sizes[2]]
+    ])
+    
+    # 로컬 좌표를 월드 좌표로 변환
     for i in range(8):
-        # 각 코너의 좌표
-        corner = np.array([
-            obb_mins[0] if (i & 1) == 0 else obb_maxs[0],
-            obb_mins[1] if (i & 2) == 0 else obb_maxs[1],
-            obb_mins[2] if (i & 4) == 0 else obb_maxs[2]
-        ])
-        # 회전 및 이동 적용
-        corners[i] = np.dot(obb_rotation, corner) + obb_center
+        corners[i] = obb_center + np.dot(obb_rotation, corners_local[i])
     
     # OBB 모서리 생성
     edges = np.array([
