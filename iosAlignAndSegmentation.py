@@ -2,16 +2,24 @@ import os
 import numpy as np
 import pyvista as pv
 
-def align_with_obb(mesh):
+def align_with_obb(mesh, debug=False):
     """
     OBB 축을 기준으로 메쉬를 정렬합니다. 
     가장 짧은 축은 z축, 가장 긴 축은 x축, 중간 길이 축은 y축으로 정렬됩니다.
     
+    구체적인 변환 과정:
+    1. 메쉬 중심점(OBB 중심)을 원점으로 이동
+    2. PCA를 통해 주축을 찾아 회전 행렬 계산
+    3. 회전 행렬을 적용하여 메쉬 정렬
+    
     Args:
         mesh: PyVista 메쉬
+        debug: 디버깅 모드 (중간 과정 시각화)
         
     Returns:
         aligned_mesh: 정렬된 메쉬
+        obb_center: OBB 중심점
+        rotation_matrix: 회전 행렬
     """
     try:
         print("[로그] align_with_obb 함수 시작")
@@ -56,12 +64,47 @@ def align_with_obb(mesh):
         print(f"[로그] 회전 행렬 계산 완료")
         
         # 회전 변환 적용 (기존 좌표계에서 표준 좌표계로 변환)
-        transformed_vertices = np.dot(vertices - mean_pt, rotation_matrix)
+        # 주의: centered_pts는 이미 중심이 원점으로 이동된 점들임
+        transformed_vertices = np.dot(centered_pts, rotation_matrix)
         print(f"[로그] 정점 변환 완료")
         
         # 변환된 정점 적용
         aligned_mesh.points = transformed_vertices
         print(f"[로그] 변환된 메쉬 생성 완료")
+        
+        # 디버깅 모드: 변환 과정 시각화
+        if debug:
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D
+            
+            fig = plt.figure(figsize=(15, 5))
+            
+            # 원본 메쉬 점 시각화
+            ax1 = fig.add_subplot(131, projection='3d')
+            ax1.scatter(vertices[:, 0], vertices[:, 1], vertices[:, 2], c='b', marker='.', alpha=0.1)
+            ax1.set_title('원본 메쉬')
+            ax1.set_xlabel('X')
+            ax1.set_ylabel('Y')
+            ax1.set_zlabel('Z')
+            
+            # 중심이 원점으로 이동된 점 시각화
+            ax2 = fig.add_subplot(132, projection='3d')
+            ax2.scatter(centered_pts[:, 0], centered_pts[:, 1], centered_pts[:, 2], c='g', marker='.', alpha=0.1)
+            ax2.set_title('중심이 원점으로 이동된 메쉬')
+            ax2.set_xlabel('X')
+            ax2.set_ylabel('Y')
+            ax2.set_zlabel('Z')
+            
+            # 회전 변환 후 점 시각화
+            ax3 = fig.add_subplot(133, projection='3d')
+            ax3.scatter(transformed_vertices[:, 0], transformed_vertices[:, 1], transformed_vertices[:, 2], c='r', marker='.', alpha=0.1)
+            ax3.set_title('회전 변환 후 메쉬')
+            ax3.set_xlabel('X')
+            ax3.set_ylabel('Y')
+            ax3.set_zlabel('Z')
+            
+            plt.tight_layout()
+            plt.show()
         
         print(f"[로그] align_with_obb 함수 완료")
         return aligned_mesh, mean_pt, rotation_matrix
@@ -774,11 +817,10 @@ def transform_mesh(mesh):
     
     Args:
         mesh: PyVista 메쉬
-        verbose: 변환 과정 출력 여부
         
     Returns:
         transformed_mesh: OBB 축 정렬 및 Y축 방향 정렬된 메쉬 (외곽점 기준 이동은 하지 않음)
-        transformation_info: 변환 정보를 담은 딕셔너리
+        transformation_info: 변환 정보를 담은 딕셔너리 (최종 변환 행렬 포함)
     """
     try:
         print("[로그] transform_mesh 함수 시작")
@@ -790,7 +832,6 @@ def transform_mesh(mesh):
         transformation_info['obb_center'] = obb_center
         transformation_info['rotation_matrix'] = rotation_matrix
         print("[로그] 통합 변환 - OBB 축 정렬 완료")
-
 
         # 단계 2: 무게중심이 +Y 방향에 오도록 회전
         print("[로그] 통합 변환 - Y축 방향 정렬 시작")
@@ -806,6 +847,130 @@ def transform_mesh(mesh):
         transformation_info['edge_point'] = edge_point
         print("[로그] 통합 변환 - 외곽점 찾기 완료")
 
+        # -------------------------------------------------------------------------
+        # 완전히 새로운 접근법: 원본 메쉬와 변환된 메쉬의 정점을 직접 이용해 변환 행렬 계산
+        # -------------------------------------------------------------------------
+        print("[로그] 새로운 방식으로 변환 행렬 계산 시작")
+        try:
+            # 원본 메쉬와 변환된 메쉬의 정점
+            src_points = mesh.points
+            dst_points = y_aligned_mesh.points
+            
+            # 최소 필요한 포인트 수 (여러 점 사용해서 정확도 향상)
+            min_points = min(1000, len(src_points))
+            
+            # 포인트 샘플링 (모든 점을 다 사용하면 느려질 수 있음)
+            step = max(1, len(src_points) // min_points)
+            src_sample = src_points[::step]
+            dst_sample = dst_points[::step]
+            
+            # 실제 사용한 샘플 수
+            n_samples = len(src_sample)
+            print(f"[로그] 변환 행렬 계산에 {n_samples}개 정점 사용")
+            
+            # 호모지니어스 좌표로 변환
+            src_homogeneous = np.ones((n_samples, 4))
+            src_homogeneous[:, :3] = src_sample
+            
+            # 최소 제곱법으로 변환 행렬 계산 (Ax = b 형태로 풀기)
+            # 각 점 (x,y,z)에 대해 변환 행렬의 각 행을 계산
+            
+            # 준비: 큰 행렬 A와 b 구성
+            A = np.zeros((n_samples * 3, 12))
+            b = np.zeros(n_samples * 3)
+            
+            for i in range(n_samples):
+                # 원본 점
+                px, py, pz = src_sample[i]
+                # 대상 점
+                qx, qy, qz = dst_sample[i]
+                
+                # x' = m11*x + m12*y + m13*z + m14
+                A[i*3, 0] = px
+                A[i*3, 1] = py
+                A[i*3, 2] = pz
+                A[i*3, 3] = 1
+                b[i*3] = qx
+                
+                # y' = m21*x + m22*y + m23*z + m24
+                A[i*3+1, 4] = px
+                A[i*3+1, 5] = py
+                A[i*3+1, 6] = pz
+                A[i*3+1, 7] = 1
+                b[i*3+1] = qy
+                
+                # z' = m31*x + m32*y + m33*z + m34
+                A[i*3+2, 8] = px
+                A[i*3+2, 9] = py
+                A[i*3+2, 10] = pz
+                A[i*3+2, 11] = 1
+                b[i*3+2] = qz
+            
+            # 최소 제곱법으로 풀기
+            # x = (A^T A)^(-1) A^T b
+            x, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
+            
+            # 계산된 변환 행렬의 맞춤 오차 출력
+            if len(residuals) > 0:
+                avg_error = np.sqrt(np.sum(residuals) / n_samples)
+                print(f"[로그] 변환 행렬 맞춤 평균 오차: {avg_error:.9f}")
+            
+            # 변환 행렬로 재구성
+            transform_matrix = np.eye(4)
+            transform_matrix[0, :] = x[0:4]
+            transform_matrix[1, :] = x[4:8]
+            transform_matrix[2, :] = x[8:12]
+            
+            # 변환 행렬 저장
+            transformation_info['transform_matrix'] = transform_matrix
+            
+            # 검증: 샘플 포인트를 변환해서 실제 변환과 비교
+            test_src = src_sample[:10]  # 처음 10개 포인트만 테스트
+            test_dst = dst_sample[:10]
+            
+            # 샘플 포인트에 변환 행렬 적용
+            test_homogeneous = np.ones((len(test_src), 4))
+            test_homogeneous[:, :3] = test_src
+            transformed = np.dot(test_homogeneous, transform_matrix.T)
+            transformed = transformed[:, :3]  # 다시 3D 좌표로 변환
+            
+            # 실제 변환된 포인트와 비교
+            errors = np.linalg.norm(transformed - test_dst, axis=1)
+            max_error = np.max(errors)
+            avg_error = np.mean(errors)
+            print(f"[로그] 변환 검증: 평균 오차 = {avg_error:.9f}, 최대 오차 = {max_error:.9f}")
+            
+            print("[로그] 새로운 방식으로 변환 행렬 계산 완료")
+            
+        except Exception as e:
+            print(f"[오류] 새로운 변환 행렬 계산 중 오류 발생: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 오류 발생 시 기존 방식으로 계산된 변환 행렬 사용
+            print("[로그] 기존 방식으로 변환 행렬 계산")
+            # OBB 정렬 변환 행렬
+            T1 = np.eye(4)
+            T1[:3, 3] = -obb_center
+            
+            R = np.eye(4)
+            R[:3, :3] = rotation_matrix
+            
+            obb_transform = np.dot(R, T1)
+            
+            # Y축 방향 정렬 변환 행렬
+            y_transform = np.eye(4)
+            if need_y_rotation:
+                y_transform[:3, :3] = np.array([
+                    [-1, 0, 0],
+                    [0, -1, 0],
+                    [0, 0, 1]
+                ])
+            
+            final_transform = np.dot(y_transform, obb_transform)
+            transformation_info['transform_matrix'] = final_transform
+            print("[로그] 기존 방식으로 변환 행렬 계산 완료")
+
         return y_aligned_mesh, transformation_info
 
     except Exception as e:
@@ -813,7 +978,7 @@ def transform_mesh(mesh):
         import traceback
         traceback.print_exc()
         # 에러가 발생해도 기본값 반환
-        return mesh.copy(), False, np.zeros(3), np.zeros(3)
+        return mesh.copy(), {'transform_matrix': np.eye(4)}
 
 def visualize_region(mesh, region_mask, color=[1, 0, 0]):
     """
@@ -849,7 +1014,154 @@ def visualize_region(mesh, region_mask, color=[1, 0, 0]):
         traceback.print_exc()
         return mesh
     
-def SlieArchIosAlignAndSegmentation(path):
+def get_transform_matrix(mesh):
+    """
+    메쉬의 변환 행렬만 계산하여 반환합니다.
+    
+    Args:
+        mesh: PyVista 메쉬
+        
+    Returns:
+        transform_matrix: 원본 메쉬에서 변환된 메쉬로의 변환 행렬
+    """
+    try:
+        print("[로그] 변환 행렬 계산 시작")
+        _, transformation_info = transform_mesh(mesh)
+        transform_matrix = transformation_info.get('transform_matrix', np.eye(4))
+        print("[로그] 변환 행렬 계산 완료")
+        return transform_matrix
+    except Exception as e:
+        print(f"[오류] 변환 행렬 계산 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return np.eye(4)
+
+def apply_transform(mesh, transform_matrix):
+    """
+    메쉬에 변환 행렬을 적용합니다.
+    
+    Args:
+        mesh: PyVista 메쉬
+        transform_matrix: 4x4 변환 행렬
+        
+    Returns:
+        transformed_mesh: 변환된 메쉬
+    """
+    try:
+        print("[로그] 변환 행렬 적용 시작")
+        
+        # 메쉬 복사
+        transformed_mesh = mesh.copy()
+        
+        # 메쉬 정점 얻기
+        vertices = mesh.points
+        
+        # 호모지니어스 좌표로 변환 (nx3 -> nx4)
+        n = vertices.shape[0]
+        homogeneous_vertices = np.ones((n, 4))
+        homogeneous_vertices[:, :3] = vertices
+        
+        # 변환 행렬 적용
+        transformed_homogeneous = np.dot(homogeneous_vertices, transform_matrix.T)
+        
+        # 호모지니어스 좌표에서 다시 3D 좌표로 변환
+        transformed_vertices = transformed_homogeneous[:, :3]
+        
+        # 변환된 정점 적용
+        transformed_mesh.points = transformed_vertices
+        
+        print("[로그] 변환 행렬 적용 완료")
+        return transformed_mesh
+    except Exception as e:
+        print(f"[오류] 변환 행렬 적용 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return mesh.copy()
+
+def validate_transformation(mesh, debug=False):
+    """
+    변환 결과를 검증합니다.
+    표준 파이프라인과 단일 변환 행렬 적용 결과를 비교합니다.
+    
+    Args:
+        mesh: 원본 메쉬
+        debug: 디버깅 정보 출력 여부
+        
+    Returns:
+        mean_error: 두 방법 간의 평균 오차 (mm)
+        max_error: 두 방법 간의 최대 오차 (mm)
+        transformed_standard: 표준 파이프라인으로 변환된 메쉬
+        transformed_direct: 단일 변환 행렬로 변환된 메쉬
+    """
+    try:
+        print("[로그] 변환 검증 시작")
+        
+        # 1. 표준 파이프라인으로 변환
+        transformed_standard, info = transform_mesh(mesh)
+        standard_points = transformed_standard.points
+        
+        # 2. 단일 변환 행렬로 변환
+        transform_matrix = info['transform_matrix']
+        transformed_direct = apply_transform(mesh, transform_matrix)
+        direct_points = transformed_direct.points
+        
+        # 3. 두 결과 비교
+        if len(standard_points) != len(direct_points):
+            print("[오류] 두 메쉬의 정점 수가 다릅니다!")
+            return float('inf'), float('inf'), transformed_standard, transformed_direct
+        
+        # 각 정점 간의 거리 계산
+        distances = np.linalg.norm(standard_points - direct_points, axis=1)
+        
+        # 평균 및 최대 오차
+        mean_error = np.mean(distances)
+        max_error = np.max(distances)
+        
+        print(f"[로그] 변환 오차: 평균 = {mean_error:.9f}mm, 최대 = {max_error:.9f}mm")
+        
+        # 디버깅 정보 출력
+        if debug:
+            # 가장 큰 차이가 나는 지점 찾기
+            if max_error > 1e-6:  # 의미 있는 차이가 있는 경우만
+                max_error_idx = np.argmax(distances)
+                print(f"[디버그] 최대 오차 위치 (인덱스 {max_error_idx}):")
+                print(f"  표준 파이프라인: {standard_points[max_error_idx]}")
+                print(f"  변환 행렬 적용: {direct_points[max_error_idx]}")
+                
+                # 변환 행렬 정보 출력
+                print(f"[디버그] 변환 행렬:")
+                print(transform_matrix)
+                
+                # 오차 분포 출력
+                percentiles = [50, 75, 90, 95, 99, 99.9]
+                for p in percentiles:
+                    p_value = np.percentile(distances, p)
+                    print(f"[디버그] {p}th 백분위수: {p_value:.9f}mm")
+        
+        return mean_error, max_error, transformed_standard, transformed_direct
+    except Exception as e:
+        print(f"[오류] 변환 검증 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf'), float('inf'), None, None
+
+def SlieArchIosAlignAndSegmentation(path, return_transform_only=False, visualize=True):
+    """
+    IOS 스캔 데이터를 정렬하고 분할합니다.
+    
+    Args:
+        path: 메쉬 파일 경로
+        return_transform_only: True인 경우 변환 행렬만 반환
+        visualize: 시각화 여부
+        
+    Returns:
+        if return_transform_only:
+            transform_matrix: 변환 행렬만 반환
+        else:
+            final_mask_mesh: 분할된 메쉬
+            transform_matrix: 변환 행렬
+            transformation_info: 변환 정보 (선택적)
+    """
     if path == "":
         raise ValueError("path is empty")
     
@@ -857,11 +1169,16 @@ def SlieArchIosAlignAndSegmentation(path):
         raise FileNotFoundError(f"The file or directory {path} does not exist.")
             
     mesh = pv.read(path)
+    
+    # 변환 행렬만 반환하는 경우
+    if return_transform_only:
+        transform_matrix = get_transform_matrix(mesh)
+        return transform_matrix
 
     # 메시 정렬
     transformed_mesh, transformation_info = transform_mesh(mesh)
     transformed_obb = get_obb(transformed_mesh)
-    # 메시 정렬
+    
     # 최종 변환된 메쉬에도 모든 작업 적용 및 결합 결과 표시
     region_mask_final = select_region_by_angle(transformed_mesh)
     boundary_indices_final = find_boundary_points(transformed_mesh, region_mask_final, n_neighbors=15)
@@ -870,21 +1187,56 @@ def SlieArchIosAlignAndSegmentation(path):
     # 최종 결과 시각화 (선택 영역 + Region Growing 결과)
     final_mask = np.logical_or(region_mask_final, grown_region_final)
     final_colored_mesh = visualize_region(transformed_mesh, final_mask, color=[0, 0.8, 0.8])
-
     final_mask_mesh = transformed_mesh.extract_points(final_mask)
 
-    p = pv.Plotter()
-    # p.add_mesh(transformed_mesh, color='#555555', opacity=0.5)
-    p.add_mesh(transformed_obb, color='red', line_width=2)
-    p.add_mesh(final_mask_mesh, opacity=0.5)
-    # p.add_mesh(boundary_indices_final, color='yellow', opacity=0.5)
-    # p.add_mesh(grown_region_final, color='red', opacity=0.5)
-    p.show()
+    # seg_output_path = os.path.join(output_dir, f"segmented_arch_{timestamp}.stl")
+    # segmented_mesh.save(seg_output_path, binary=False)
+    # print(f"[메인] 세그먼테이션 결과 ASCII STL로 저장 완료: {seg_output_path}")
+    
+    # 변환 행렬 추출
+    transform_matrix = transformation_info.get('transform_matrix', np.eye(4))
 
-    return final_mask_mesh, transformation_info
+    # 시각화가 필요한 경우
+    if visualize:
+        p = pv.Plotter()
+        # p.add_mesh(transformed_mesh, color='#555555', opacity=0.5)
+        p.add_mesh(transformed_obb, color='red', line_width=2)
+        p.add_mesh(final_mask_mesh, opacity=0.5)
+        # p.add_mesh(boundary_indices_final, color='yellow', opacity=0.5)
+        # p.add_mesh(grown_region_final, color='red', opacity=0.5)
+        p.show()
+
+    # 최종 결과 반환: 분할된 메쉬와 변환 행렬 모두 반환
+    return final_mask_mesh, transform_matrix, transformation_info
 
 if __name__ == "__main__":
     model_path = "assets/data/transformed/transformed_model_20250408_091623.stl"
-    final_mask_mesh, transformation_info = SlieArchIosAlignAndSegmentation(model_path)
-
-    print(transformation_info)
+    
+    # 1. 전체 처리 실행: 세그멘테이션 결과와 변환 행렬 얻기
+    print("[메인] IOS 아치 정렬 및 세그멘테이션 시작")
+    segmented_mesh, transform_matrix, info = SlieArchIosAlignAndSegmentation(model_path, visualize=True)
+    
+    # 2. 결과 출력
+    print("[메인] 처리 완료")
+    print(f"세그먼테이션 결과: {segmented_mesh.n_points}개 정점, {segmented_mesh.n_cells}개 셀")
+    print("변환 행렬:")
+    print(transform_matrix)
+    
+    # 3. STL 파일로 저장 (선택적)
+    try:
+        # 결과 디렉토리 확인 및 생성
+        output_dir = "results"
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # 파일명 생성 (현재 시간 기반)
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 세그먼테이션 결과 저장
+        seg_output_path = os.path.join(output_dir, f"segmented_arch_{timestamp}.stl")
+        # UnstructuredGrid를 PolyData로 변환
+        surface_mesh = segmented_mesh.extract_surface()
+        surface_mesh.save(seg_output_path, binary=False)  # ASCII 형식으로 저장
+        print(f"[메인] 세그먼테이션 결과 ASCII STL로 저장 완료: {seg_output_path}")
+        
