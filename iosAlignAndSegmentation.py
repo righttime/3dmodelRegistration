@@ -1145,6 +1145,49 @@ def validate_transformation(mesh, debug=False):
         traceback.print_exc()
         return float('inf'), float('inf'), None, None
 
+def normalize_mesh_position(mesh, edge_point):
+    """
+    변환된 메쉬를 최종 정규화:
+    1. 레이캐스팅으로 찾은 edge_point를 원점(0,0,0)으로 이동
+    2. 가장 낮은 Z값이 0이 되도록 Z축 방향으로 이동
+    
+    Args:
+        mesh: PyVista 메쉬
+        edge_point: 레이캐스팅으로 찾은 외곽점
+        
+    Returns:
+        normalized_mesh: 정규화된 메쉬
+    """
+    try:
+        print("[로그] normalize_mesh_position 함수 시작")
+        
+        # 메쉬 복사
+        normalized_mesh = mesh.copy()
+        vertices = normalized_mesh.points
+        
+        # 1. edge_point를 원점(0,0,0)으로 이동
+        translation_vector = -edge_point
+        vertices_translated = vertices + translation_vector
+        
+        # 2. 가장 낮은 Z값이 0이 되도록 Z축 이동
+        min_z = np.min(vertices_translated[:, 2])
+        vertices_translated[:, 2] -= min_z
+        
+        # 변환된 정점 적용
+        normalized_mesh.points = vertices_translated
+        
+        print(f"[로그] 메쉬 정규화 완료")
+        print(f"[로그] edge_point({edge_point})를 원점으로 이동")
+        print(f"[로그] Z축 최소값({min_z})을 0으로 이동")
+        
+        return normalized_mesh
+    
+    except Exception as e:
+        print(f"[오류] 메쉬 정규화 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return mesh.copy()
+
 def SlieArchIosAlignAndSegmentation(path, return_transform_only=False, visualize=True):
     """
     IOS 스캔 데이터를 정렬하고 분할합니다.
@@ -1188,10 +1231,18 @@ def SlieArchIosAlignAndSegmentation(path, return_transform_only=False, visualize
     final_mask = np.logical_or(region_mask_final, grown_region_final)
     final_colored_mesh = visualize_region(transformed_mesh, final_mask, color=[0, 0.8, 0.8])
     final_mask_mesh = transformed_mesh.extract_points(final_mask)
-
-    # seg_output_path = os.path.join(output_dir, f"segmented_arch_{timestamp}.stl")
-    # segmented_mesh.save(seg_output_path, binary=False)
-    # print(f"[메인] 세그먼테이션 결과 ASCII STL로 저장 완료: {seg_output_path}")
+    
+    # 레이캐스팅 포인트 추출 (이미 계산된 값 사용)
+    edge_point = transformation_info.get('edge_point')
+    
+    # 최종 정규화: edge_point를 원점으로, 최소 Z값을 0으로 이동
+    if edge_point is not None:
+        print("[로그] 메쉬 위치 정규화 시작")
+        final_mask_mesh = normalize_mesh_position(final_mask_mesh, edge_point)
+        transformed_mesh = normalize_mesh_position(transformed_mesh, edge_point)
+        print("[로그] 메쉬 위치 정규화 완료")
+    else:
+        print("[경고] 외곽점(edge_point)이 없어 정규화를 수행하지 않습니다.")
     
     # 변환 행렬 추출
     transform_matrix = transformation_info.get('transform_matrix', np.eye(4))
@@ -1239,4 +1290,8 @@ if __name__ == "__main__":
         surface_mesh = segmented_mesh.extract_surface()
         surface_mesh.save(seg_output_path, binary=False)  # ASCII 형식으로 저장
         print(f"[메인] 세그먼테이션 결과 ASCII STL로 저장 완료: {seg_output_path}")
-        
+    except Exception as e:
+        print(f"[오류] STL 저장 중 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+
